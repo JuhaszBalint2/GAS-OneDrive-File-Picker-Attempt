@@ -1,0 +1,430 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <base target="_top">
+    <title>OneDrive Picker</title>
+    <style>
+        body { font-family: sans-serif; margin: 20px; }
+        button { padding: 10px 15px; font-size: 1em; cursor: pointer; margin-top: 5px; }
+        button:disabled { cursor: not-allowed; opacity: 0.6; }
+        #statusGlobal { margin-top: 15px; color: #555; }
+        #pickedFiles { margin-top: 15px; padding: 10px; border: 1px solid #ccc; background-color: #f9f9f9; white-space: pre-wrap; word-break: break-all; }
+    </style>
+</head>
+<body>
+    <h1>OneDrive File Picker</h1>
+
+    <div id="authSection" style="display:none;">
+        <p>To use the OneDrive Picker, you need to authorize this application.</p>
+        <button id="authorizeButton">Authorize with Microsoft</button>
+    </div>
+
+    <div id="pickerSection" style="display:none;">
+        <p id="signedInStatus">Authenticated. Ready to launch picker.</p>
+        <button id="launchPickerButton">Launch OneDrive Picker</button>
+        <button id="signOutButton">Sign Out (Reset Auth)</button>
+    </div>
+
+    <div id="statusGlobal">Initializing...</div>
+    <div id="pickedFiles"></div>
+
+    <script>
+        const pickerBaseUrl = "https://onedrive.live.com/picker";
+        let pickerParamsConfig = {};
+        let pickerWindow = null;
+        let pickerMessagePort = null;
+        let SCRIPT_APP_URL = '';
+
+        let authorizeButtonEl, launchPickerButtonEl, signOutButtonEl,
+            authSectionEl, pickerSectionEl, signedInStatusEl, statusGlobalDivEl;
+
+        function initializeDOMElements() {
+            authorizeButtonEl = document.getElementById("authorizeButton");
+            launchPickerButtonEl = document.getElementById("launchPickerButton");
+            signOutButtonEl = document.getElementById("signOutButton");
+            authSectionEl = document.getElementById("authSection");
+            pickerSectionEl = document.getElementById("pickerSection");
+            signedInStatusEl = document.getElementById("signedInStatus");
+            statusGlobalDivEl = document.getElementById("statusGlobal");
+
+            authorizeButtonEl.onclick = startAuthorization;
+            launchPickerButtonEl.onclick = launchPickerAction;
+            signOutButtonEl.onclick = signOutAction;
+        }
+
+        function initializePickerParams() {
+            try {
+                const currentOrigin = window.location.origin;
+                console.log("Using current window origin for picker messaging:", currentOrigin);
+                pickerParamsConfig = {
+                    sdk: "8.0", entry: { oneDrive: { files: {} } }, authentication: {}, // authentication: {} is key for token passthrough
+                    messaging: { origin: currentOrigin, channelId: "gappsPickerChannel" + Date.now() },
+                    typesAndSources: { mode: "files", pivots: { oneDrive: true, recent: true } },
+                };
+                console.log("Picker params initialized. Full config:", JSON.stringify(pickerParamsConfig));
+            } catch (e) {
+                console.error("Error initializing picker params:", e);
+                statusGlobalDivEl.innerText = "Error setting up picker parameters.";
+            }
+        }
+
+        function updateUIVisibility(isAuthenticated) {
+            console.log("updateUIVisibility called with isAuthenticated:", isAuthenticated);
+            if (!authSectionEl || !pickerSectionEl || !signOutButtonEl || !authorizeButtonEl || !launchPickerButtonEl) {
+                console.error("updateUIVisibility: DOM elements not ready.");
+                return;
+            }
+
+            if (isAuthenticated) {
+                authSectionEl.style.display = 'none';
+                pickerSectionEl.style.display = 'block';
+                signedInStatusEl.innerText = "Authenticated. Ready to launch picker.";
+                statusGlobalDivEl.innerText = "Ready.";
+                signOutButtonEl.disabled = false;
+                launchPickerButtonEl.disabled = false;
+                launchPickerButtonEl.innerText = "Launch OneDrive Picker";
+            } else {
+                authSectionEl.style.display = 'block';
+                pickerSectionEl.style.display = 'none';
+                statusGlobalDivEl.innerText = "Please authorize to use the picker.";
+                authorizeButtonEl.disabled = false;
+                authorizeButtonEl.innerText = "Authorize with Microsoft";
+            }
+        }
+
+        function startAuthorization() {
+            authorizeButtonEl.disabled = true;
+            authorizeButtonEl.innerText = "Redirecting...";
+            statusGlobalDivEl.innerText = "Getting authorization URL from server...";
+            google.script.run
+                .withSuccessHandler(function(microsoftAuthUrl) {
+                    if (microsoftAuthUrl) {
+                        console.log("Received Microsoft Auth URL:", microsoftAuthUrl);
+                        statusGlobalDivEl.innerText = "Redirecting to Microsoft for authorization...";
+                        window.top.location.href = microsoftAuthUrl;
+                    } else {
+                        statusGlobalDivEl.innerText = "Error: Could not get authorization URL from server.";
+                        authorizeButtonEl.disabled = false;
+                        authorizeButtonEl.innerText = "Authorize with Microsoft";
+                    }
+                })
+                .withFailureHandler(function(err) {
+                    console.error("Error calling getMicrosoftAuthUrl:", err);
+                    statusGlobalDivEl.innerText = "Error initiating authorization: " + (err.message || JSON.stringify(err));
+                    authorizeButtonEl.disabled = false;
+                    authorizeButtonEl.innerText = "Authorize with Microsoft";
+                })
+                .getMicrosoftAuthUrl();
+        }
+
+        async function launchPickerAction() {
+            launchPickerButtonEl.disabled = true;
+            launchPickerButtonEl.innerText = "Loading Token...";
+            statusGlobalDivEl.innerText = "Fetching access token for picker...";
+
+            google.script.run
+                .withSuccessHandler(async function(accessToken) {
+                    if (accessToken) {
+                        console.log("Access token retrieved for picker launch (launchPickerAction). Length:", accessToken.length);
+                        statusGlobalDivEl.innerText = "Token acquired. Launching picker...";
+                        await launchPickerWithToken(accessToken);
+                        // Re-enable button only if picker launch doesn't take over or fails early
+                        // launchPickerWithToken will handle re-enabling or UI updates
+                    } else {
+                        statusGlobalDivEl.innerText = "Failed to get access token. Please try authorizing again.";
+                        console.error("launchPickerAction: Failed to get access token from server.");
+                        updateUIVisibility(false);
+                        launchPickerButtonEl.innerText = "Launch OneDrive Picker";
+                        launchPickerButtonEl.disabled = false;
+                    }
+                })
+                .withFailureHandler(function(err) {
+                    console.error("Error calling getOneDriveAccessToken for picker (launchPickerAction):", err);
+                    statusGlobalDivEl.innerText = "Error fetching token: " + (err.message || JSON.stringify(err));
+                    updateUIVisibility(true); // Stay on picker view, but re-enable button
+                    launchPickerButtonEl.innerText = "Launch OneDrive Picker";
+                    launchPickerButtonEl.disabled = false;
+                })
+                .getOneDriveAccessToken();
+        }
+
+        async function launchPickerWithToken(authToken) {
+            console.log("launchPickerWithToken: Proceeding with token (first 10 chars):", authToken ? authToken.substring(0,10) : "NULL");
+            document.getElementById("pickedFiles").innerHTML = "";
+
+            if (!authToken) {
+                statusGlobalDivEl.innerText = "Cannot launch picker: Authentication token is missing.";
+                console.error("launchPickerWithToken: authToken is null or undefined.");
+                updateUIVisibility(false);
+                launchPickerButtonEl.innerText = "Launch OneDrive Picker";
+                launchPickerButtonEl.disabled = false;
+                return;
+            }
+
+            if (Object.keys(pickerParamsConfig).length === 0) {
+                console.warn("Picker params not initialized, attempting to initialize now.");
+                initializePickerParams();
+                if (Object.keys(pickerParamsConfig).length === 0) {
+                     statusGlobalDivEl.innerText = "Error: Picker configuration is missing.";
+                     updateUIVisibility(true);
+                     launchPickerButtonEl.innerText = "Launch OneDrive Picker";
+                     launchPickerButtonEl.disabled = false;
+                     return;
+                }
+            }
+            // Ensure authentication object is present for token passthrough
+            pickerParamsConfig.authentication = {};
+            console.log("Using pickerParamsConfig for POST:", JSON.stringify(pickerParamsConfig));
+
+            // Log the full token for easy copying and decoding (for debugging)
+            console.log("Full token for decoding (copy this directly from console if debugging):");
+            console.log(authToken);
+            // End logging full token
+
+            if (pickerWindow && !pickerWindow.closed) { pickerWindow.close(); }
+            cleanupPickerCommunication(false); // Clean up old listeners/ports but don't close window yet if it's about to be reused
+            const windowName = "OneDrivePicker_" + Date.now();
+            pickerWindow = window.open("", windowName, "width=800,height=600,resizable=yes,scrollbars=yes");
+
+            if (!pickerWindow || pickerWindow.closed || typeof pickerWindow.closed == 'undefined') {
+                 statusGlobalDivEl.innerText = "Popup window for picker blocked. Please allow popups for this site.";
+                 console.error("Picker popup window was blocked or failed to open."); pickerWindow = null;
+                 updateUIVisibility(true);
+                 launchPickerButtonEl.innerText = "Launch OneDrive Picker";
+                 launchPickerButtonEl.disabled = false;
+                 return;
+            }
+
+            // Brief delay to allow the popup window to fully initialize its document object
+            await new Promise(resolve => setTimeout(resolve, 300)); // Increased delay slightly
+
+            if (pickerWindow.closed) { // Check again if user closed it quickly
+                statusGlobalDivEl.innerText = "Picker window was closed before it could be used.";
+                console.error("Picker window closed prematurely.");
+                updateUIVisibility(true);
+                launchPickerButtonEl.innerText = "Launch OneDrive Picker";
+                launchPickerButtonEl.disabled = false;
+                return;
+            }
+
+            let pickerUrl;
+            try {
+                const filePickerJson = JSON.stringify(pickerParamsConfig);
+                const queryStringParams = new URLSearchParams({ filePicker: filePickerJson });
+                pickerUrl = `${pickerBaseUrl}?${queryStringParams.toString()}`;
+            } catch (e) {
+                console.error("Error constructing picker URL:", e);
+                if(pickerWindow && !pickerWindow.closed) pickerWindow.close();
+                statusGlobalDivEl.innerText = "Error preparing picker URL.";
+                updateUIVisibility(true);
+                launchPickerButtonEl.innerText = "Launch OneDrive Picker";
+                launchPickerButtonEl.disabled = false;
+                return;
+            }
+
+            console.log("launchPickerWithToken: FINAL pickerUrl for form action:", pickerUrl);
+
+            try {
+                const form = pickerWindow.document.createElement("form");
+                form.setAttribute("action", pickerUrl); form.setAttribute("method", "POST");
+                const tokenInput = pickerWindow.document.createElement("input");
+                tokenInput.setAttribute("type", "hidden"); tokenInput.setAttribute("name", "access_token");
+                tokenInput.setAttribute("value", authToken); form.appendChild(tokenInput);
+                pickerWindow.document.body.appendChild(form); // Ensure body exists
+
+                if (pickerWindow.document.body.contains(form)) {
+                    form.submit();
+                    statusGlobalDivEl.innerText = "Picker launched. Waiting for interaction...";
+                } else {
+                    console.error("Form NOT appended to picker window's document body!");
+                    if (pickerWindow && !pickerWindow.closed) pickerWindow.close();
+                    cleanupPickerCommunication(true);
+                    statusGlobalDivEl.innerText = "Error: Could not prepare picker window content.";
+                    updateUIVisibility(true);
+                }
+            } catch (err) {
+                console.error("Error creating or submitting form in picker window:", err);
+                if (pickerWindow && !pickerWindow.closed) pickerWindow.close();
+                cleanupPickerCommunication(true);
+                statusGlobalDivEl.innerText = "Error launching picker. Check console for details.";
+                updateUIVisibility(true);
+            }
+
+            window.addEventListener("message", handlePickerMessage); // Add listener for messages from picker window
+            launchPickerButtonEl.disabled = false; // Re-enable after attempting to launch
+            launchPickerButtonEl.innerText = "Launch OneDrive Picker";
+        }
+
+        function signOutAction() {
+            if (!signOutButtonEl) { console.error("Sign out button not found"); return; }
+            signOutButtonEl.disabled = true;
+            signOutButtonEl.innerText = "Signing Out...";
+            statusGlobalDivEl.innerText = "Resetting authentication...";
+            google.script.run
+                .withSuccessHandler(function() {
+                    console.log("Authentication reset on server.");
+                    statusGlobalDivEl.innerText = "Authentication reset. Please authorize again.";
+                    updateUIVisibility(false);
+                })
+                .withFailureHandler(function(err) {
+                    console.error("Error resetting authentication:", err);
+                    statusGlobalDivEl.innerText = "Error resetting authentication: " + (err.message || JSON.stringify(err));
+                    if (signOutButtonEl) {
+                       signOutButtonEl.disabled = false;
+                       signOutButtonEl.innerText = "Sign Out (Reset Auth)";
+                    }
+                })
+                .resetOneDriveAuth();
+        }
+
+        async function handlePickerMessage(event) {
+            // Basic validation of the message source and structure
+            if (!pickerWindow || event.source !== pickerWindow || !event.data || !pickerParamsConfig.messaging || event.data.channelId !== pickerParamsConfig.messaging.channelId) {
+                // console.warn("handlePickerMessage: Discarding message not matching expected source or channelId.", event.data);
+                return;
+            }
+            const message = event.data;
+            console.log("Message from picker (window):", message);
+            switch (message.type) {
+                case "initialize":
+                    if (message.channelId === pickerParamsConfig.messaging.channelId && event.ports && event.ports[0]) {
+                        pickerMessagePort = event.ports[0];
+                        pickerMessagePort.addEventListener("message", handlePickerPortMessage);
+                        pickerMessagePort.start();
+                        pickerMessagePort.postMessage({ type: "activate" });
+                        console.log("Picker initialized and activated via MessageChannel port.");
+                    }
+                    break;
+                case "error":
+                    console.error("Error message from picker window:", message.error);
+                    statusGlobalDivEl.innerText = `Picker Error: ${message.error.message || 'Unknown error'} (code: ${message.error.code || 'N/A'})`;
+                    if (pickerWindow && !pickerWindow.closed) pickerWindow.close();
+                    cleanupPickerCommunication(true);
+                    updateUIVisibility(true);
+                    break;
+            }
+        }
+
+        async function handlePickerPortMessage(messageEvent) {
+            const message = messageEvent.data;
+            console.log("Message from picker port:", message);
+            if (!pickerMessagePort) { return; } // Should not happen if port is active
+            switch (message.type) {
+                case "notification": console.log(`Picker Notification: ${JSON.stringify(message.data)}`); break;
+                case "command":
+                    pickerMessagePort.postMessage({ type: "acknowledge", id: message.id });
+                    const command = message.data;
+                    switch (command.command) {
+                        case "authenticate":
+                            console.log("Picker requested re-authentication. Getting fresh token from server.");
+                            statusGlobalDivEl.innerText = "Picker needs re-authentication. Fetching token...";
+                            google.script.run
+                                .withSuccessHandler(function(newAuthToken) {
+                                    if (newAuthToken) {
+                                        console.log("Responding to picker 'authenticate' with new token. Length:", newAuthToken.length);
+                                        pickerMessagePort.postMessage({
+                                            type: "result",
+                                            id: message.id,
+                                            data: { result: "token", token: newAuthToken }
+                                        });
+                                        console.log("New token sent back to picker via MessageChannel.");
+                                        statusGlobalDivEl.innerText = "Re-authentication token provided to picker.";
+                                    } else {
+                                        console.error("Failed to get new token for picker re-auth from server.");
+                                        pickerMessagePort.postMessage({ type: "result", id: message.id, data: { result: "error", error: { code: "authenticationFailed", message: "Re-auth token fetch failed from server" } } });
+                                        statusGlobalDivEl.innerText = "Failed to provide re-authentication token.";
+                                    }
+                                })
+                                .withFailureHandler(function(err) {
+                                     console.error("Failed to re-authenticate for picker (server error):", err);
+                                     pickerMessagePort.postMessage({ type: "result", id: message.id, data: { result: "error", error: { code: "authenticationFailed", message: "Re-auth server error: " + (err.message || JSON.stringify(err)) } } });
+                                     statusGlobalDivEl.innerText = "Error during picker re-authentication.";
+                                })
+                                .getOneDriveAccessToken();
+                            break;
+                        case "pick":
+                            console.log("Files picked:", command.items);
+                            document.getElementById("pickedFiles").innerHTML = `<p>Files Selected:</p><pre>${JSON.stringify(command.items, null, 2)}</pre>`;
+                            statusGlobalDivEl.innerText = "Files selected!";
+                            pickerMessagePort.postMessage({ type: "result", id: message.id, data: { result: "success" } });
+                            if (pickerWindow && !pickerWindow.closed) pickerWindow.close();
+                            cleanupPickerCommunication(true);
+                            updateUIVisibility(true);
+                            break;
+                        case "close":
+                            console.log("Picker closed by command.");
+                            if (pickerWindow && !pickerWindow.closed) pickerWindow.close();
+                            cleanupPickerCommunication(true);
+                            statusGlobalDivEl.innerText = "Picker closed.";
+                            updateUIVisibility(true);
+                            break;
+                        default:
+                            console.warn(`Unsupported picker command: ${command.command}`);
+                            pickerMessagePort.postMessage({ type: "result", id: message.id, data: { result: "error", error: { code: "unsupportedCommand", message: `Command '${command.command}' not supported.` } } });
+                            break;
+                    }
+                    break;
+            }
+        }
+
+        function cleanupPickerCommunication(closeWindowAndNullify) {
+            window.removeEventListener("message", handlePickerMessage);
+            if (pickerMessagePort) {
+                pickerMessagePort.removeEventListener("message", handlePickerPortMessage);
+                try { pickerMessagePort.close(); } catch(e) { console.warn("Error closing port", e); }
+                pickerMessagePort = null;
+            }
+            if (closeWindowAndNullify) {
+                if (pickerWindow && !pickerWindow.closed) {
+                    try { pickerWindow.close(); } catch(e) { console.warn("Error closing picker window", e); }
+                }
+                pickerWindow = null;
+            }
+            console.log("Picker communication cleaned up. Close window:", closeWindowAndNullify);
+        }
+
+        window.onload = function() {
+            console.log("--- window.onload ---");
+            initializeDOMElements();
+
+            statusGlobalDivEl.innerText = "Initializing application...";
+            initializePickerParams();
+
+            google.script.run
+                .withSuccessHandler(function(url) {
+                    SCRIPT_APP_URL = url;
+                    if (!SCRIPT_APP_URL) {
+                        statusGlobalDivEl.innerText = "Error: Could not get application URL. App may not function correctly.";
+                        if(authorizeButtonEl) authorizeButtonEl.disabled = true;
+                        return;
+                    }
+                    console.log("Application /exec URL (for reference):", SCRIPT_APP_URL);
+
+                    statusGlobalDivEl.innerText = "Checking current authentication status...";
+                    google.script.run
+                        .withSuccessHandler(function(accessToken) {
+                            if (accessToken) {
+                                console.log("window.onload: Already authenticated. Token (first 10):", accessToken.substring(0,10) + "...");
+                                updateUIVisibility(true);
+                            } else {
+                                console.log("window.onload: Not authenticated.");
+                                updateUIVisibility(false);
+                            }
+                        })
+                        .withFailureHandler(function(err) {
+                            console.error("window.onload: Error checking initial auth status:", err);
+                            statusGlobalDivEl.innerText = "Error checking auth: " + (err.message || JSON.stringify(err));
+                            updateUIVisibility(false); // Assume not authenticated on error
+                        })
+                        .getOneDriveAccessToken();
+                })
+                .withFailureHandler(function(err) {
+                    console.error("window.onload: Error getting script app URL:", err);
+                    statusGlobalDivEl.innerText = "Initialization Error (URL). App may not function correctly.";
+                    if (authorizeButtonEl) authorizeButtonEl.disabled = true;
+                })
+                .getScriptUrl();
+        };
+    </script>
+</body>
+</html>
